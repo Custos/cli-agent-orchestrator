@@ -801,17 +801,85 @@ async def get_terminal_memory_context(terminal_id: TerminalId):
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
 async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
-    """Get the current working directory of a terminal's pane."""
+    """Get the current working directory of a terminal's pane.
+
+    Falls back to a provisioned worktree path for ids that have no tmux pane
+    (e.g. a Rust-PTY Claude frame, whose I/O is owned by Tauri, not CAO) so the
+    desktop file watcher + attribution still resolve a directory for it.
+    """
     try:
         working_directory = terminal_service.get_working_directory(terminal_id)
         return WorkingDirectoryResponse(working_directory=working_directory)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError:
+        # No tmux terminal: a Rust-PTY/provisioned id resolves via its worktree.
+        from cli_agent_orchestrator.clients.database import get_worktree
+
+        wt = get_worktree(terminal_id)
+        if wt and wt.get("worktree_path"):
+            return WorkingDirectoryResponse(working_directory=wt["worktree_path"])
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get working directory: {str(e)}",
         )
+
+
+class ProvisionWorktreeRequest(BaseModel):
+    """Provision a worktree for a terminal id that CAO does not own (Rust PTY)."""
+
+    project_root: str
+    provider: str = "claude_code"
+    isolate: bool = True
+    session_name: Optional[str] = None
+
+
+@app.post("/worktrees/provision", response_model=WorktreeResponse)
+async def provision_worktree(req: ProvisionWorktreeRequest) -> WorktreeResponse:
+    """Generate a terminal id + provision a worktree for it, so a Rust-PTY agent
+    gets the SAME attribution surface (dirty state, per-file/per-hunk diff,
+    timeline, activity graph) as a CAO terminal — all of which key off this id.
+
+    isolate=False (or a non-git project) records a shared-dir row instead.
+    """
+    from cli_agent_orchestrator.clients.database import upsert_worktree
+    from cli_agent_orchestrator.services import worktree_service
+    from cli_agent_orchestrator.utils.terminal import generate_terminal_id
+
+    terminal_id = generate_terminal_id()
+    if req.isolate:
+        info = worktree_service.ensure_worktree(req.project_root, terminal_id, req.provider)
+    else:
+        info = worktree_service.WorktreeInfo(
+            terminal_key=terminal_id,
+            project_root=req.project_root,
+            repo_root=None,
+            worktree_path=req.project_root,
+            branch=None,
+            base_sha=None,
+            mode="shared",
+        )
+    upsert_worktree(
+        terminal_id=terminal_id,
+        project_root=info.project_root,
+        worktree_path=info.worktree_path,
+        mode=info.mode,
+        session_name=req.session_name,
+        repo_root=info.repo_root,
+        branch=info.branch,
+        base_sha=info.base_sha,
+        provider=req.provider,
+    )
+    return WorktreeResponse(
+        terminal_id=terminal_id,
+        mode=info.mode,
+        worktree_path=info.worktree_path,
+        project_root=info.project_root,
+        repo_root=info.repo_root,
+        branch=info.branch,
+        base_sha=info.base_sha,
+        provider=req.provider,
+    )
 
 
 @app.post("/terminals/{terminal_id}/input")
