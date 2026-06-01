@@ -173,6 +173,63 @@ def record_checkpoint(terminal_id: str, boundary: str) -> Dict[str, Any]:
     return {"turn_id": open_turn["id"], "files_touched": files, "snapshot": end_snap}
 
 
+def file_attribution(terminal_id: str) -> Dict[str, Any]:
+    """Per-file authorship for a (team) worktree review.
+
+    Answers "who last changed this file, in which turn" by walking the team's
+    per-turn snapshots (each turn records the files it touched). The latest turn
+    to touch a file owns it; files touched by >1 agent are flagged as shared.
+
+    Returns {"team": [...members...], "files": {path: {last, contributors}}}.
+    For a non-isolated terminal returns empty (the diff is the agent's own).
+    """
+    wt = database.get_worktree(terminal_id)
+    if not wt or wt.get("mode") not in ("worktree", "member"):
+        return {"team": [], "files": {}}
+
+    path = wt.get("worktree_path") or ""
+    team = database.list_worktrees_by_path(path)
+    team_ids = {t["terminal_id"] for t in team}
+    provider_by_id = {t["terminal_id"]: t.get("provider") for t in team}
+
+    turns = database.list_turns(wt.get("session_name") or "")
+    team_turns = [t for t in turns if t["terminal_id"] in team_ids]
+    # Order so the LATEST turn to touch a file wins "last".
+    team_turns.sort(key=lambda t: (t.get("ended_at") or t.get("started_at") or datetime.min))
+
+    files: Dict[str, Any] = {}
+    for t in team_turns:
+        ended = t.get("ended_at")
+        contrib = {
+            "terminal_id": t["terminal_id"],
+            "provider": provider_by_id.get(t["terminal_id"]),
+            "turn_index": t["turn_index"],
+            "ended_at": ended.isoformat() if ended else None,
+        }
+        for f in t.get("files_touched") or []:
+            entry = files.setdefault(f, {"last": None, "contributors": []})
+            if not any(
+                c["terminal_id"] == contrib["terminal_id"]
+                and c["turn_index"] == contrib["turn_index"]
+                for c in entry["contributors"]
+            ):
+                entry["contributors"].append(contrib)
+            entry["last"] = contrib  # ascending order → last wins
+
+    return {
+        "team": [
+            {
+                "terminal_id": t["terminal_id"],
+                "provider": t.get("provider"),
+                "mode": t.get("mode"),
+                "member_of": t.get("member_of"),
+            }
+            for t in team
+        ],
+        "files": files,
+    }
+
+
 _EDGE_KINDS = {"handoff", "assign", "send_message"}
 
 

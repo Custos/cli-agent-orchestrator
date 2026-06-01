@@ -997,6 +997,15 @@ async def get_worktree_contention(session: str) -> List[ContentionEntry]:
     return [ContentionEntry(path=r["path"], terminals=r["terminals"]) for r in rows]
 
 
+@app.get("/terminals/{terminal_id}/attribution")
+async def get_terminal_attribution(terminal_id: TerminalId) -> Dict:
+    """Per-file authorship (which member/turn last changed each file) for a team
+    worktree review — powers the provenance shown in the diff (Taime)."""
+    from cli_agent_orchestrator.services import activity_service
+
+    return activity_service.file_attribution(terminal_id)
+
+
 @app.get("/terminals/{terminal_id}/worktree", response_model=Optional[WorktreeResponse])
 async def get_terminal_worktree(terminal_id: TerminalId) -> Optional[WorktreeResponse]:
     """Return per-agent worktree provenance for a terminal, or null if the

@@ -461,19 +461,28 @@ def apply_selection(
 
 
 def get_session_contention(session_name: str) -> List[dict]:
-    """Files changed by more than one agent in a session (collision risk).
-
-    Returns [{path, terminals: [...]}] computed from each worktree's changed-file
-    set vs its own base. Pure overlap detection — no merge is attempted.
+    """Files changed in more than one DISTINCT worktree in a session (collision
+    risk). A delegation team shares ONE worktree, so its members are NOT
+    contention with each other — we dedupe by worktree_path and represent each
+    checkout by its owner. Real contention is two separate agents/teams (distinct
+    worktrees) touching the same file. Pure overlap detection — no merge attempted.
     """
     from cli_agent_orchestrator.clients.database import list_worktrees_by_session
 
-    by_path: dict = {}
+    # One representative terminal per distinct checkout (prefer the owner).
+    rep_by_path: dict = {}
     for wt in list_worktrees_by_session(session_name):
-        cwd = wt.get("worktree_path")
+        p = wt.get("worktree_path")
+        if not p:
+            continue
+        if p not in rep_by_path or wt.get("mode") == "worktree":
+            rep_by_path[p] = wt
+
+    by_path: dict = {}
+    for cwd, wt in rep_by_path.items():
         base = wt.get("base_sha") or "HEAD"
         tid = wt.get("terminal_id")
-        if not cwd or not os.path.isdir(cwd):
+        if not os.path.isdir(cwd):
             continue
         tree = _worktree_tree(cwd)
         if not tree:
