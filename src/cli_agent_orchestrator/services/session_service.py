@@ -51,12 +51,17 @@ def create_session(
     allowed_tools: list[str] | None = None,
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
+    isolate: bool = False,
+    project_root: str | None = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
     ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
     They are persisted on the session record so every worker spawned later
     in the same session inherits them. See issue #248.
+
+    ``isolate`` + ``project_root`` (Taime): run the agent in its own git
+    worktree off ``project_root`` for provable per-agent change attribution.
     """
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -72,6 +77,8 @@ def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
+        isolate=isolate,
+        project_root=project_root,
     )
     dispatch_plugin_event(
         registry,
