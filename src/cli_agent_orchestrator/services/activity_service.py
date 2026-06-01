@@ -198,7 +198,9 @@ def file_attribution(terminal_id: str) -> Dict[str, Any]:
     team_turns.sort(key=lambda t: (t.get("ended_at") or t.get("started_at") or datetime.min))
 
     files: Dict[str, Any] = {}
+    turn_map: Dict[Any, Any] = {}  # (terminal_id, turn_index) -> turn row (for snapshots)
     for t in team_turns:
+        turn_map[(t["terminal_id"], t["turn_index"])] = t
         ended = t.get("ended_at")
         contrib = {
             "terminal_id": t["terminal_id"],
@@ -215,6 +217,54 @@ def file_attribution(terminal_id: str) -> Dict[str, Any]:
             ):
                 entry["contributors"].append(contrib)
             entry["last"] = contrib  # ascending order → last wins
+
+    # Per-HUNK authorship for files touched by >1 teammate: attribute each
+    # current hunk to the turn whose edits best match its added lines (content
+    # match, drift-resistant). Turns "review per hunk" into real guidance.
+    shared = [p for p, info in files.items() if len(info["contributors"]) > 1]
+    if shared:
+        from cli_agent_orchestrator.services import diff_service
+
+        cwd, base = diff_service.resolve_worktree_context(terminal_id)
+        if cwd:
+            hunks_by_path = {
+                f["path"]: f["hunks"] for f in diff_service.get_hunked_diff(terminal_id)["files"]
+            }
+            for p in shared:
+                cur_hunks = hunks_by_path.get(p, [])
+                if not cur_hunks:
+                    continue
+                turn_added = []  # (contributor, set(added line contents))
+                for c in files[p]["contributors"]:
+                    tr = turn_map.get((c["terminal_id"], c["turn_index"]))
+                    if not tr or not tr.get("end_snapshot"):
+                        continue
+                    added = set(
+                        diff_service.added_lines_for_file(
+                            cwd, tr.get("start_snapshot") or base, tr["end_snapshot"], p
+                        )
+                    )
+                    turn_added.append((c, added))
+                hunk_authors: Dict[str, Any] = {}
+                for h in cur_hunks:
+                    hl = {
+                        ln[1:]
+                        for ln in h["text"].splitlines()
+                        if ln.startswith("+") and not ln.startswith("+++")
+                    }
+                    best, best_score = None, 0
+                    for c, added in turn_added:
+                        score = len(hl & added)
+                        if score > best_score:
+                            best, best_score = c, score
+                    if best and best_score > 0:
+                        hunk_authors[str(h["index"])] = {
+                            "terminal_id": best["terminal_id"],
+                            "provider": best["provider"],
+                            "turn_index": best["turn_index"],
+                        }
+                if hunk_authors:
+                    files[p]["hunks"] = hunk_authors
 
     return {
         "team": [

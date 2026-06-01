@@ -341,6 +341,19 @@ def _parse_unified(raw: str) -> List[dict]:
     return out
 
 
+def added_lines_for_file(cwd: str, ref_a: str, ref_b: str, path: str) -> List[str]:
+    """The added (`+`) line contents a change introduced to ``path`` between two
+    refs — used to attribute current hunks to the turn that authored them."""
+    if not ref_a or not ref_b:
+        return []
+    r = _run_git(cwd, ["diff", ref_a, ref_b, "--", path])
+    return [
+        ln[1:]
+        for ln in r.stdout.splitlines()
+        if ln.startswith("+") and not ln.startswith("+++")
+    ]
+
+
 def get_hunked_diff(terminal_id: str) -> dict:
     """Per-file, per-hunk diff of an agent's changes vs its base.
 
