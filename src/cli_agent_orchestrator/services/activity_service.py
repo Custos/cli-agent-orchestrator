@@ -45,9 +45,37 @@ def record_fs_events(terminal_id: str, events: List[Dict[str, Any]]) -> Dict[str
         provider = meta.get("provider") if meta else None
         mode = "shared"
 
-    confidence = "certain" if mode == "worktree" else "heuristic"
+    # Attribution. In an isolated worktree shared by a single agent → certain.
+    # When the worktree is a TEAM (owner + delegated members share the checkout),
+    # attribute the change to whichever teammate currently has an open turn
+    # (processing-state correlation); the authoritative per-agent answer is the
+    # per-turn snapshot diff. Plain shared-dir → heuristic.
+    attributed_terminal = terminal_id
+    if worktree and mode in ("worktree", "member"):
+        team = database.list_worktrees_by_path(worktree.get("worktree_path", ""))
+        if len(team) <= 1:
+            confidence = "certain"
+        else:
+            processing = [
+                m["terminal_id"]
+                for m in team
+                if database.get_open_turn(m["terminal_id"])
+            ]
+            if len(processing) == 1:
+                attributed_terminal = processing[0]
+                confidence = "inferred"
+            elif len(processing) > 1:
+                confidence = "contended"
+            else:
+                confidence = "team"
+            provider = next(
+                (m["provider"] for m in team if m["terminal_id"] == attributed_terminal),
+                provider,
+            )
+    else:
+        confidence = "heuristic"
 
-    open_turn = database.get_open_turn(terminal_id)
+    open_turn = database.get_open_turn(attributed_terminal)
     turn_id = open_turn["id"] if open_turn else None
 
     recorded = 0
@@ -55,22 +83,26 @@ def record_fs_events(terminal_id: str, events: List[Dict[str, Any]]) -> Dict[str
         path = ev.get("path")
         if not path:
             continue
+        meta = {"confidence": confidence, "mode": mode}
+        if attributed_terminal != terminal_id:
+            # Record who reported it vs who we attributed it to (team case).
+            meta["reported_by"] = terminal_id
         database.record_activity(
             kind="fs_change",
-            terminal_id=terminal_id,
+            terminal_id=attributed_terminal,
             session_name=session_name,
             provider=provider,
             path=path,
             change_kind=ev.get("kind"),
             turn_id=turn_id,
             ts=_ts_from_millis(ev.get("ts")),
-            meta={"confidence": confidence, "mode": mode},
+            meta=meta,
         )
         recorded += 1
 
     return {
         "recorded": recorded,
-        "terminal_id": terminal_id,
+        "terminal_id": attributed_terminal,
         "mode": mode,
         "confidence": confidence,
     }
@@ -90,7 +122,9 @@ def record_checkpoint(terminal_id: str, boundary: str) -> Dict[str, Any]:
     session_name = worktree.get("session_name") if worktree else None
     provider = worktree.get("provider") if worktree else None
     wt_path = worktree.get("worktree_path") if worktree else None
-    is_wt = bool(worktree and worktree.get("mode") == "worktree" and wt_path)
+    # Members share the team worktree → snapshot it for their turns too, so a
+    # delegated agent gets CERTAIN per-turn file attribution.
+    is_wt = bool(worktree and worktree.get("mode") in ("worktree", "member") and wt_path)
 
     if boundary == "turn_start":
         snap = worktree_service.snapshot(wt_path, "taime turn start") if is_wt else None
@@ -194,6 +228,7 @@ def build_graph(session_name: str) -> Dict[str, Any]:
                 "provider": provider_for(tid),
                 "mode": wt.get("mode"),
                 "branch": wt.get("branch"),
+                "member_of": wt.get("member_of"),  # conductor id for team members
                 "turns": turns_by_term.get(tid, []),
             }
         )

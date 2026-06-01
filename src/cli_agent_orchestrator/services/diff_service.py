@@ -141,7 +141,9 @@ def resolve_worktree_context(terminal_id: str) -> Tuple[Optional[str], str]:
     tmux working directory diffed against HEAD for non-isolated terminals.
     """
     wt = get_worktree(terminal_id)
-    if wt and wt.get("mode") == "worktree" and wt.get("worktree_path"):
+    # "member" agents share the conductor's team worktree, so they resolve to the
+    # same checkout + base as the owner.
+    if wt and wt.get("mode") in ("worktree", "member") and wt.get("worktree_path"):
         if os.path.isdir(wt["worktree_path"]):
             return wt["worktree_path"], (wt.get("base_sha") or "HEAD")
     # Fallback: live pane cwd vs HEAD.

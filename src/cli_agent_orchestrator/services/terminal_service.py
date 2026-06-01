@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -30,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     delete_worktree,
     get_terminal_metadata,
     get_worktree,
+    get_worktree_owner_by_path,
     update_last_active,
     update_terminal_shell_command,
     upsert_worktree,
@@ -258,6 +260,33 @@ def create_terminal(
                 base_sha=wt_info.base_sha,
                 provider=provider,
             )
+        elif working_directory:
+            # Step 3a-member (Taime): a delegated sub-agent (handoff/assign)
+            # inherits the conductor's working dir. If that dir is an existing
+            # team worktree, enroll this terminal as a MEMBER so its per-turn
+            # snapshots + team diff/merge resolve to the team's branch.
+            owner = get_worktree_owner_by_path(working_directory) or get_worktree_owner_by_path(
+                os.path.realpath(working_directory)
+            )
+            if owner:
+                upsert_worktree(
+                    terminal_id=terminal_id,
+                    project_root=owner["project_root"],
+                    worktree_path=owner["worktree_path"],
+                    mode="member",
+                    session_name=session_name,
+                    repo_root=owner["repo_root"],
+                    branch=owner["branch"],
+                    base_sha=owner["base_sha"],
+                    provider=provider,
+                    member_of=owner["terminal_id"],
+                )
+                logger.info(
+                    "Terminal %s enrolled as member of team worktree %s (conductor %s)",
+                    terminal_id,
+                    owner["worktree_path"],
+                    owner["terminal_id"],
+                )
 
         # Step 3b: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for

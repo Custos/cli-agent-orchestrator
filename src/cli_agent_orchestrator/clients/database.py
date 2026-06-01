@@ -102,9 +102,12 @@ class FlowModel(Base):
 class WorktreeModel(Base):
     """Per-agent git worktree provisioned for activity attribution (Taime).
 
-    One row per isolated terminal. ``mode`` is "worktree" when the agent runs in
-    its own checkout/branch, or "shared" when it falls back to the project dir
-    (non-git repo, no commits, or git failure).
+    One row per terminal. ``mode``:
+    - "worktree": the agent owns an isolated checkout/branch.
+    - "shared": fell back to the project dir (non-git, no commits, git failure).
+    - "member": a delegated sub-agent sharing the conductor's TEAM worktree
+      (``member_of`` = the conductor's terminal_id). Same worktree_path/branch
+      as the owner, so per-turn snapshots + team diff/merge resolve correctly.
     """
 
     __tablename__ = "taime_worktrees"
@@ -118,6 +121,7 @@ class WorktreeModel(Base):
     base_sha = Column(String, nullable=True)
     mode = Column(String, nullable=False, default="shared")
     provider = Column(String, nullable=True)
+    member_of = Column(String, nullable=True)  # conductor terminal_id for "member" rows
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -179,6 +183,24 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_terminals_schema()
     _migrate_memory_indexes()
+    _migrate_taime_worktrees_schema()
+
+
+def _migrate_taime_worktrees_schema() -> None:
+    """Add the member_of column to taime_worktrees if missing (team-worktree)."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(taime_worktrees)")}
+            if "member_of" not in cols:
+                conn.execute("ALTER TABLE taime_worktrees ADD COLUMN member_of TEXT")
+                conn.commit()
+                logger.info("Migration: added member_of column to taime_worktrees")
+    except Exception as e:
+        logger.debug(f"taime_worktrees migration skipped: {e}")
 
 
 def _migrate_memory_indexes() -> None:
@@ -597,6 +619,7 @@ def _worktree_to_dict(w: "WorktreeModel") -> Dict[str, Any]:
         "base_sha": w.base_sha,
         "mode": w.mode,
         "provider": w.provider,
+        "member_of": w.member_of,
         "created_at": w.created_at,
     }
 
@@ -611,6 +634,7 @@ def upsert_worktree(
     branch: Optional[str] = None,
     base_sha: Optional[str] = None,
     provider: Optional[str] = None,
+    member_of: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create or replace the worktree record for a terminal."""
     with SessionLocal() as db:
@@ -626,6 +650,7 @@ def upsert_worktree(
         w.branch = branch
         w.base_sha = base_sha
         w.provider = provider
+        w.member_of = member_of
         db.commit()
         db.refresh(w)
         return _worktree_to_dict(w)
@@ -636,6 +661,31 @@ def get_worktree(terminal_id: str) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
         w = db.query(WorktreeModel).filter(WorktreeModel.terminal_id == terminal_id).first()
         return _worktree_to_dict(w) if w else None
+
+
+def get_worktree_owner_by_path(worktree_path: str) -> Optional[Dict[str, Any]]:
+    """The OWNER worktree (mode="worktree") whose checkout is ``worktree_path``,
+    or None. Used to detect when a delegated sub-agent is launched into an
+    existing team worktree so we can enroll it as a member."""
+    with SessionLocal() as db:
+        w = (
+            db.query(WorktreeModel)
+            .filter(
+                WorktreeModel.worktree_path == worktree_path,
+                WorktreeModel.mode == "worktree",
+            )
+            .first()
+        )
+        return _worktree_to_dict(w) if w else None
+
+
+def list_worktrees_by_path(worktree_path: str) -> List[Dict[str, Any]]:
+    """All terminals sharing a worktree checkout (owner + members = a team)."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(WorktreeModel).filter(WorktreeModel.worktree_path == worktree_path).all()
+        )
+        return [_worktree_to_dict(w) for w in rows]
 
 
 def list_worktrees_by_session(session_name: str) -> List[Dict[str, Any]]:

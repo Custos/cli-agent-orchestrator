@@ -205,13 +205,14 @@ class WorktreeResponse(BaseModel):
     """Per-agent worktree provenance for Taime attribution."""
 
     terminal_id: str
-    mode: str = "shared"  # "worktree" | "shared"
+    mode: str = "shared"  # "worktree" | "shared" | "member"
     worktree_path: str = ""
     project_root: Optional[str] = None
     repo_root: Optional[str] = None
     branch: Optional[str] = None
     base_sha: Optional[str] = None
     provider: Optional[str] = None
+    member_of: Optional[str] = None  # conductor terminal_id for team members
 
 
 class FsEventItem(BaseModel):
@@ -1014,6 +1015,7 @@ async def get_terminal_worktree(terminal_id: TerminalId) -> Optional[WorktreeRes
         branch=record["branch"],
         base_sha=record["base_sha"],
         provider=record["provider"],
+        member_of=record.get("member_of"),
     )
 
 
