@@ -27,7 +27,7 @@ from cli_agent_orchestrator.clients.database import (
     list_terminals_by_session,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.constants import SESSION_PREFIX, is_view_session
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -41,6 +41,9 @@ from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
 logger = logging.getLogger(__name__)
+
+# Local alias so tests can patch detection at the service boundary.
+_is_view_session = is_view_session
 
 
 def create_session(
@@ -95,7 +98,14 @@ def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
         tmux_sessions = tmux_client.list_sessions()
-        return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        # Per-connection view sessions (``<real>__v<hex>``) start with the
+        # already-prefixed real name, so filter them out here or they surface
+        # as phantom sidebar rows. See constants.is_view_session.
+        return [
+            s
+            for s in tmux_sessions
+            if s["id"].startswith(SESSION_PREFIX) and not _is_view_session(s["id"])
+        ]
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
         return []

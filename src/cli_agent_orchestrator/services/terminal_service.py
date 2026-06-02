@@ -37,7 +37,11 @@ from cli_agent_orchestrator.clients.database import (
     upsert_worktree,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import (
+    SESSION_PREFIX,
+    TERMINAL_LOG_DIR,
+    is_view_session,
+)
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -201,6 +205,19 @@ def create_terminal(
             # Ensure session name has the CAO prefix for identification
             if not session_name.startswith(SESSION_PREFIX):
                 session_name = f"{SESSION_PREFIX}{session_name}"
+
+            # The ``__v<8hex>`` suffix is reserved for per-connection view
+            # sessions (see constants.is_view_session); a real session ending
+            # that way would be wrongly hidden from list_sessions() and reaped
+            # at startup. Mangle the trailing separator to break the anchored
+            # pattern while keeping the name recognizable.
+            if is_view_session(session_name):
+                logger.warning(
+                    "Session name %s collides with the reserved view-session "
+                    "suffix; appending '-s' to disambiguate",
+                    session_name,
+                )
+                session_name = f"{session_name}-s"
 
             # Prevent duplicate sessions
             if tmux_client.session_exists(session_name):

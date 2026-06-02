@@ -9,6 +9,8 @@ for agent management.
 """
 
 import os
+import re
+import uuid
 from pathlib import Path
 
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -18,6 +20,31 @@ from cli_agent_orchestrator.models.provider import ProviderType
 # =============================================================================
 # All CAO-managed tmux sessions are prefixed to distinguish them from user sessions
 SESSION_PREFIX = "cao-"
+
+# =============================================================================
+# Per-connection view sessions
+# =============================================================================
+# Each terminal-streaming WebSocket spins up its own grouped tmux "view" session
+# named ``<real_session>__v<hex>`` so multiple panels of the same session keep
+# independent active windows (see api/main.py:terminal_ws). These views share the
+# real session's window list but own nothing — killing one never touches the real
+# session, its windows, or the agents running in them. Because the view name
+# starts with the already-prefixed real name it would otherwise leak into
+# ``list_sessions()`` as a phantom row, so naming + detection live here, once.
+VIEW_SESSION_SUFFIX_HEX_LEN = 8
+# Anchored with ``\Z`` (true end-of-string — unlike ``$`` it does not also match
+# before a trailing newline): ``__v`` + exactly N hex chars + end-of-string.
+VIEW_SESSION_PATTERN = re.compile(rf"__v[0-9a-f]{{{VIEW_SESSION_SUFFIX_HEX_LEN}}}\Z")
+
+
+def make_view_session_name(session_name: str) -> str:
+    """Build a unique per-connection view-session name for ``session_name``."""
+    return f"{session_name}__v{uuid.uuid4().hex[:VIEW_SESSION_SUFFIX_HEX_LEN]}"
+
+
+def is_view_session(name: str) -> bool:
+    """True if ``name`` is a per-connection view session (not a real session)."""
+    return VIEW_SESSION_PATTERN.search(name) is not None
 
 # =============================================================================
 # Provider Configuration
