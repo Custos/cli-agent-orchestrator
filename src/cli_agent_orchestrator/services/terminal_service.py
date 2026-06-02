@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -27,9 +28,13 @@ from typing import Dict, Optional
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    delete_worktree,
     get_terminal_metadata,
+    get_worktree,
+    get_worktree_owner_by_path,
     update_last_active,
     update_terminal_shell_command,
+    upsert_worktree,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
@@ -43,6 +48,7 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import (
@@ -123,6 +129,8 @@ def create_terminal(
     allowed_tools: Optional[list[str]] = None,
     registry: PluginRegistry | None = None,
     env_vars: Optional[dict[str, str]] = None,
+    isolate: bool = False,
+    project_root: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -154,6 +162,7 @@ def create_terminal(
         TimeoutError: If provider initialization times out
     """
     session_created = False  # tracks whether THIS call created the tmux session
+    wt_info = None  # Taime isolation: provisioned worktree, recorded post-creation
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -162,6 +171,30 @@ def create_terminal(
             session_name = generate_session_name()
 
         window_name = generate_window_name(agent_profile)
+
+        # Step 1b (Taime): provision a per-agent git worktree so this agent's
+        # filesystem changes are physically isolated and provably attributable.
+        # The agent runs the real CLI in its own checkout/branch. Falls back to
+        # the shared dir transparently for non-git projects (mode="shared").
+        if isolate and project_root:
+            wt_info = worktree_service.ensure_worktree(project_root, terminal_id, provider)
+            if wt_info.mode == "worktree":
+                working_directory = wt_info.worktree_path
+                logger.info(
+                    "Terminal %s isolated in worktree %s (%s)",
+                    terminal_id,
+                    wt_info.worktree_path,
+                    wt_info.branch,
+                )
+            else:
+                # Shared fallback: run in the project dir as before.
+                working_directory = working_directory or project_root
+                logger.info(
+                    "Terminal %s not isolated (%s); using shared dir %s",
+                    terminal_id,
+                    wt_info.error,
+                    working_directory,
+                )
 
         # Step 2: Create tmux session or window
         if new_session:
@@ -213,6 +246,47 @@ def create_terminal(
             agent_profile,
             allowed_tools,
         )
+
+        # Step 3a (Taime): record the worktree now that session_name is final.
+        if wt_info is not None:
+            upsert_worktree(
+                terminal_id=terminal_id,
+                project_root=wt_info.project_root,
+                worktree_path=wt_info.worktree_path,
+                mode=wt_info.mode,
+                session_name=session_name,
+                repo_root=wt_info.repo_root,
+                branch=wt_info.branch,
+                base_sha=wt_info.base_sha,
+                provider=provider,
+            )
+        elif working_directory:
+            # Step 3a-member (Taime): a delegated sub-agent (handoff/assign)
+            # inherits the conductor's working dir. If that dir is an existing
+            # team worktree, enroll this terminal as a MEMBER so its per-turn
+            # snapshots + team diff/merge resolve to the team's branch.
+            owner = get_worktree_owner_by_path(working_directory) or get_worktree_owner_by_path(
+                os.path.realpath(working_directory)
+            )
+            if owner:
+                upsert_worktree(
+                    terminal_id=terminal_id,
+                    project_root=owner["project_root"],
+                    worktree_path=owner["worktree_path"],
+                    mode="member",
+                    session_name=session_name,
+                    repo_root=owner["repo_root"],
+                    branch=owner["branch"],
+                    base_sha=owner["base_sha"],
+                    provider=provider,
+                    member_of=owner["terminal_id"],
+                )
+                logger.info(
+                    "Terminal %s enrolled as member of team worktree %s (conductor %s)",
+                    terminal_id,
+                    owner["worktree_path"],
+                    owner["terminal_id"],
+                )
 
         # Step 3b: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for
@@ -297,6 +371,15 @@ def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
+        # Taime: tear down the worktree we provisioned for this failed terminal.
+        if wt_info is not None and wt_info.mode == "worktree" and wt_info.repo_root:
+            try:
+                worktree_service.remove_worktree(
+                    wt_info.repo_root, wt_info.worktree_path, wt_info.branch
+                )
+                delete_worktree(terminal_id)
+            except Exception:
+                pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
                 tmux_client.kill_session(session_name)

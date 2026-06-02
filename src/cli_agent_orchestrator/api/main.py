@@ -10,9 +10,10 @@ import signal
 import struct
 import subprocess
 import termios
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Dict, List, Optional, cast
+from typing import Annotated, Any, Dict, List, Optional, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -115,6 +116,151 @@ async def opencode_inbox_delivery_daemon(registry: PluginRegistry) -> None:
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+
+
+class DiffResponse(BaseModel):
+    working_directory: Optional[str] = None
+    is_git: bool = False
+    diff: str = ""
+    files_changed: int = 0
+    files: List[str] = []
+    error: Optional[str] = None
+
+
+class FileDiffEntry(BaseModel):
+    """One changed file with both sides for a side-by-side review."""
+
+    path: str
+    status: str
+    original: str = ""
+    modified: str = ""
+    additions: int = 0
+    deletions: int = 0
+    binary: bool = False
+    old_path: Optional[str] = None
+
+
+class FileDiffsResponse(BaseModel):
+    """Structured per-file diff of an agent's changes vs its base."""
+
+    terminal_id: str
+    files: List[FileDiffEntry] = []
+
+
+class HunkEntry(BaseModel):
+    index: int
+    header: str
+    text: str
+    additions: int = 0
+    deletions: int = 0
+
+
+class HunkedFileEntry(BaseModel):
+    path: str
+    old_path: Optional[str] = None
+    hunks: List[HunkEntry] = []
+
+
+class HunkedDiffResponse(BaseModel):
+    """Per-file, per-hunk diff for the selective merge/revert UI."""
+
+    terminal_id: str
+    base: Optional[str] = None
+    files: List[HunkedFileEntry] = []
+
+
+class ApplyRequest(BaseModel):
+    """Selective apply request. ``selections`` maps a path to the hunk indices to
+    apply (or null/omitted = all hunks of that path)."""
+
+    target: str = "main"  # "main" | <terminal_id>
+    mode: str = "merge"  # "merge" | "revert"
+    selections: Dict[str, Optional[List[int]]] = {}
+
+
+class ApplyResponse(BaseModel):
+    applied: bool
+    target_dir: Optional[str] = None
+    files: List[str] = []
+    conflicts: List[str] = []
+    error: Optional[str] = None
+
+
+class ContentionEntry(BaseModel):
+    path: str
+    terminals: List[str] = []
+
+
+class WorkspaceInfoResponse(BaseModel):
+    """Probe of a candidate project directory for the workspace picker."""
+
+    path: str
+    exists: bool = False
+    is_git: bool = False
+    repo_root: Optional[str] = None
+    branch: Optional[str] = None
+    head_short: Optional[str] = None
+
+
+class WorktreeResponse(BaseModel):
+    """Per-agent worktree provenance for Taime attribution."""
+
+    terminal_id: str
+    mode: str = "shared"  # "worktree" | "shared" | "member"
+    worktree_path: str = ""
+    project_root: Optional[str] = None
+    repo_root: Optional[str] = None
+    branch: Optional[str] = None
+    base_sha: Optional[str] = None
+    provider: Optional[str] = None
+    member_of: Optional[str] = None  # conductor terminal_id for team members
+
+
+class FsEventItem(BaseModel):
+    """One filesystem change forwarded by the desktop watcher."""
+
+    path: str
+    kind: Optional[str] = None  # create | modify | delete
+    ts: Optional[int] = None  # ms since epoch
+
+
+class FsEventsRequest(BaseModel):
+    """Batch of fs changes attributed to a terminal (Taime activity graph)."""
+
+    terminal_id: str
+    events: List[FsEventItem] = []
+
+
+class ActivityEventResponse(BaseModel):
+    """One row of the activity timeline / graph."""
+
+    id: str
+    ts: Optional[str] = None
+    kind: str
+    terminal_id: Optional[str] = None
+    session_name: Optional[str] = None
+    agent_profile: Optional[str] = None
+    provider: Optional[str] = None
+    target_terminal_id: Optional[str] = None
+    path: Optional[str] = None
+    change_kind: Optional[str] = None
+    turn_id: Optional[str] = None
+    snapshot_sha: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
+
+
+class GrokOneshotRequest(BaseModel):
+    """Body for the Grok headless fast path (convenience, not the default)."""
+
+    prompt: str
+    working_directory: Optional[str] = None
+    model: Optional[str] = None
+
+
+class GrokOneshotResponse(BaseModel):
+    ok: bool
+    output: str
+    error: Optional[str] = None
 
 
 class SkillContentResponse(BaseModel):
@@ -335,6 +481,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",
         "opencode_cli": "opencode",
+        "grok_cli": "grok",
     }
     result = []
     for provider, binary in provider_binaries.items():
@@ -419,6 +566,8 @@ async def create_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     memory_manager: Optional[str] = None,
+    isolate: bool = False,
+    project_root: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
@@ -461,6 +610,8 @@ async def create_session(
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
             env_vars=env_vars,
+            isolate=isolate,
+            project_root=project_root,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -555,6 +706,8 @@ async def create_terminal_in_session(
     provider: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    isolate: bool = False,
+    project_root: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
@@ -578,6 +731,8 @@ async def create_terminal_in_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
+            isolate=isolate,
+            project_root=project_root,
         )
         return result
     except ValueError as e:
@@ -647,17 +802,85 @@ async def get_terminal_memory_context(terminal_id: TerminalId):
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
 async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
-    """Get the current working directory of a terminal's pane."""
+    """Get the current working directory of a terminal's pane.
+
+    Falls back to a provisioned worktree path for ids that have no tmux pane
+    (e.g. a Rust-PTY Claude frame, whose I/O is owned by Tauri, not CAO) so the
+    desktop file watcher + attribution still resolve a directory for it.
+    """
     try:
         working_directory = terminal_service.get_working_directory(terminal_id)
         return WorkingDirectoryResponse(working_directory=working_directory)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError:
+        # No tmux terminal: a Rust-PTY/provisioned id resolves via its worktree.
+        from cli_agent_orchestrator.clients.database import get_worktree
+
+        wt = get_worktree(terminal_id)
+        if wt and wt.get("worktree_path"):
+            return WorkingDirectoryResponse(working_directory=wt["worktree_path"])
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get working directory: {str(e)}",
         )
+
+
+class ProvisionWorktreeRequest(BaseModel):
+    """Provision a worktree for a terminal id that CAO does not own (Rust PTY)."""
+
+    project_root: str
+    provider: str = "claude_code"
+    isolate: bool = True
+    session_name: Optional[str] = None
+
+
+@app.post("/worktrees/provision", response_model=WorktreeResponse)
+async def provision_worktree(req: ProvisionWorktreeRequest) -> WorktreeResponse:
+    """Generate a terminal id + provision a worktree for it, so a Rust-PTY agent
+    gets the SAME attribution surface (dirty state, per-file/per-hunk diff,
+    timeline, activity graph) as a CAO terminal — all of which key off this id.
+
+    isolate=False (or a non-git project) records a shared-dir row instead.
+    """
+    from cli_agent_orchestrator.clients.database import upsert_worktree
+    from cli_agent_orchestrator.services import worktree_service
+    from cli_agent_orchestrator.utils.terminal import generate_terminal_id
+
+    terminal_id = generate_terminal_id()
+    if req.isolate:
+        info = worktree_service.ensure_worktree(req.project_root, terminal_id, req.provider)
+    else:
+        info = worktree_service.WorktreeInfo(
+            terminal_key=terminal_id,
+            project_root=req.project_root,
+            repo_root=None,
+            worktree_path=req.project_root,
+            branch=None,
+            base_sha=None,
+            mode="shared",
+        )
+    upsert_worktree(
+        terminal_id=terminal_id,
+        project_root=info.project_root,
+        worktree_path=info.worktree_path,
+        mode=info.mode,
+        session_name=req.session_name,
+        repo_root=info.repo_root,
+        branch=info.branch,
+        base_sha=info.base_sha,
+        provider=req.provider,
+    )
+    return WorktreeResponse(
+        terminal_id=terminal_id,
+        mode=info.mode,
+        worktree_path=info.worktree_path,
+        project_root=info.project_root,
+        repo_root=info.repo_root,
+        branch=info.branch,
+        base_sha=info.base_sha,
+        provider=req.provider,
+    )
 
 
 @app.post("/terminals/{terminal_id}/input")
@@ -700,6 +923,272 @@ async def get_terminal_output(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get output: {str(e)}",
         )
+
+
+@app.post("/grok/oneshot", response_model=GrokOneshotResponse)
+async def grok_oneshot(req: GrokOneshotRequest) -> GrokOneshotResponse:
+    """Run ``grok -p`` headlessly (Taime convenience fast path, not default)."""
+    from cli_agent_orchestrator.services.grok_oneshot import run_grok_oneshot
+
+    result = run_grok_oneshot(
+        prompt=req.prompt,
+        working_directory=req.working_directory,
+        model=req.model,
+    )
+    return GrokOneshotResponse(
+        ok=result.ok, output=result.output, error=result.error
+    )
+
+
+@app.get("/terminals/{terminal_id}/diff", response_model=DiffResponse)
+async def get_terminal_diff(terminal_id: TerminalId) -> DiffResponse:
+    """Return the working-tree diff (git) for a terminal's directory.
+
+    Added by Taime to power the diff/approval matrix. Non-git directories
+    return is_git=False with an explanatory error rather than failing.
+    """
+    from cli_agent_orchestrator.services import diff_service
+
+    try:
+        result = diff_service.get_terminal_diff(terminal_id)
+        return DiffResponse(
+            working_directory=result.working_directory,
+            is_git=result.is_git,
+            diff=result.diff,
+            files_changed=result.files_changed,
+            files=result.files,
+            error=result.error,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compute diff: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/file-diffs", response_model=FileDiffsResponse)
+async def get_terminal_file_diffs(terminal_id: TerminalId) -> FileDiffsResponse:
+    """Structured per-file diff (both sides) of an agent's changes vs its base —
+    powers the Monaco side-by-side review and selective merge/revert (Taime)."""
+    from cli_agent_orchestrator.services import diff_service
+
+    try:
+        files = diff_service.get_file_diffs(terminal_id)
+        return FileDiffsResponse(
+            terminal_id=terminal_id,
+            files=[
+                FileDiffEntry(
+                    path=f.path,
+                    status=f.status,
+                    original=f.original,
+                    modified=f.modified,
+                    additions=f.additions,
+                    deletions=f.deletions,
+                    binary=f.binary,
+                    old_path=f.old_path,
+                )
+                for f in files
+            ],
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compute file diffs: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/hunks", response_model=HunkedDiffResponse)
+async def get_terminal_hunks(terminal_id: TerminalId) -> HunkedDiffResponse:
+    """Per-file, per-hunk diff of an agent's changes vs its base (Taime)."""
+    from cli_agent_orchestrator.services import diff_service
+
+    try:
+        data = diff_service.get_hunked_diff(terminal_id)
+        return HunkedDiffResponse(
+            terminal_id=terminal_id,
+            base=data.get("base"),
+            files=[
+                HunkedFileEntry(
+                    path=f["path"],
+                    old_path=f.get("old_path"),
+                    hunks=[HunkEntry(**h) for h in f["hunks"]],
+                )
+                for f in data["files"]
+            ],
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compute hunks: {str(e)}",
+        )
+
+
+@app.post("/terminals/{terminal_id}/apply", response_model=ApplyResponse)
+async def apply_terminal_selection(
+    terminal_id: TerminalId, req: ApplyRequest, request: Request
+) -> ApplyResponse:
+    """Selectively merge an agent's changes onto a target (the main checkout or
+    another agent's worktree), or revert them from the agent itself (Taime)."""
+    from cli_agent_orchestrator.clients.database import get_worktree, record_activity
+    from cli_agent_orchestrator.services import diff_service
+
+    try:
+        result = diff_service.apply_selection(
+            terminal_id, req.target, req.selections, req.mode
+        )
+        # Record the merge/revert as a graph event (provenance of the landing).
+        if result.get("applied"):
+            wt = get_worktree(terminal_id)
+            record_activity(
+                kind=req.mode,  # "merge" | "revert"
+                terminal_id=terminal_id,
+                target_terminal_id=None if req.target == "main" else req.target,
+                session_name=(wt or {}).get("session_name"),
+                provider=(wt or {}).get("provider"),
+                meta={"target": req.target, "files": result.get("files", [])},
+            )
+        return ApplyResponse(**{k: result[k] for k in result if k in ApplyResponse.model_fields})
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to apply selection: {str(e)}",
+        )
+
+
+@app.get("/worktrees/contention", response_model=List[ContentionEntry])
+async def get_worktree_contention(session: str) -> List[ContentionEntry]:
+    """Files changed by more than one agent in a session (collision risk)."""
+    from cli_agent_orchestrator.services import diff_service
+
+    rows = diff_service.get_session_contention(session)
+    return [ContentionEntry(path=r["path"], terminals=r["terminals"]) for r in rows]
+
+
+@app.get("/terminals/{terminal_id}/attribution")
+async def get_terminal_attribution(terminal_id: TerminalId) -> Dict:
+    """Per-file authorship (which member/turn last changed each file) for a team
+    worktree review — powers the provenance shown in the diff (Taime)."""
+    from cli_agent_orchestrator.services import activity_service
+
+    return activity_service.file_attribution(terminal_id)
+
+
+@app.get("/terminals/{terminal_id}/worktree", response_model=Optional[WorktreeResponse])
+async def get_terminal_worktree(terminal_id: TerminalId) -> Optional[WorktreeResponse]:
+    """Return per-agent worktree provenance for a terminal, or null if the
+    terminal was never isolated (no worktree record)."""
+    from cli_agent_orchestrator.clients.database import get_worktree
+
+    record = get_worktree(terminal_id)
+    if not record:
+        return None
+    return WorktreeResponse(
+        terminal_id=record["terminal_id"],
+        mode=record["mode"],
+        worktree_path=record["worktree_path"],
+        project_root=record["project_root"],
+        repo_root=record["repo_root"],
+        branch=record["branch"],
+        base_sha=record["base_sha"],
+        provider=record["provider"],
+        member_of=record.get("member_of"),
+    )
+
+
+def _activity_rows_to_response(rows: List[Dict[str, Any]]) -> List[ActivityEventResponse]:
+    out: List[ActivityEventResponse] = []
+    for r in rows:
+        ts = r.get("ts")
+        out.append(
+            ActivityEventResponse(
+                id=r["id"],
+                ts=ts.isoformat() if ts else None,
+                kind=r["kind"],
+                terminal_id=r.get("terminal_id"),
+                session_name=r.get("session_name"),
+                agent_profile=r.get("agent_profile"),
+                provider=r.get("provider"),
+                target_terminal_id=r.get("target_terminal_id"),
+                path=r.get("path"),
+                change_kind=r.get("change_kind"),
+                turn_id=r.get("turn_id"),
+                snapshot_sha=r.get("snapshot_sha"),
+                meta=r.get("meta"),
+            )
+        )
+    return out
+
+
+@app.post("/activity/fs-events")
+async def post_fs_events(req: FsEventsRequest) -> Dict:
+    """Ingest a batch of filesystem-change events from the desktop watcher and
+    attribute them to a terminal in the activity graph (Taime)."""
+    from cli_agent_orchestrator.services import activity_service
+
+    try:
+        return activity_service.record_fs_events(
+            req.terminal_id, [e.model_dump() for e in req.events]
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to record fs events: {str(e)}",
+        )
+
+
+@app.get("/activity", response_model=List[ActivityEventResponse])
+async def get_activity(
+    session: Optional[str] = None,
+    terminal_id: Optional[str] = None,
+    limit: int = 1000,
+) -> List[ActivityEventResponse]:
+    """Query the activity timeline (newest first), filterable by session/terminal."""
+    from cli_agent_orchestrator.clients.database import list_activity
+
+    rows = list_activity(session_name=session, terminal_id=terminal_id, limit=limit)
+    return _activity_rows_to_response(rows)
+
+
+class CheckpointRequest(BaseModel):
+    """Turn-boundary checkpoint driven by the agent's status transitions."""
+
+    terminal_id: str
+    boundary: str  # "turn_start" | "turn_end"
+
+
+@app.post("/activity/checkpoint")
+async def post_checkpoint(req: CheckpointRequest) -> Dict:
+    """Snapshot an agent's tree at a turn boundary and record the turn (Taime)."""
+    from cli_agent_orchestrator.services import activity_service
+
+    try:
+        return activity_service.record_checkpoint(req.terminal_id, req.boundary)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to record checkpoint: {str(e)}",
+        )
+
+
+@app.get("/workspace/info", response_model=WorkspaceInfoResponse)
+async def get_workspace_info(path: str) -> WorkspaceInfoResponse:
+    """Probe a candidate project directory (exists / git / branch) so the
+    workspace picker can show whether agents will isolate (Taime)."""
+    from cli_agent_orchestrator.services import worktree_service
+
+    info = worktree_service.workspace_info(path)
+    return WorkspaceInfoResponse(**info)
+
+
+@app.get("/activity/graph")
+async def get_activity_graph(session: str) -> Dict:
+    """The session's activity graph: agent nodes + turns, orchestration edges,
+    and contended files — the queryable 'who did what, when, and why' (Taime)."""
+    from cli_agent_orchestrator.services import activity_service
+
+    return activity_service.build_graph(session)
 
 
 @app.post("/terminals/{terminal_id}/exit")
@@ -898,8 +1387,31 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # browser-side xterm.js renderer sees the escape sequences it expects.
     # Any explicit non-dumb TERM the operator set is preserved.
     pty_env = _build_pty_env()
+
+    # Each WebSocket gets its OWN tmux client view via a per-connection grouped
+    # session, so two panels showing different windows of the SAME session don't
+    # fight over the session's single "current window" pointer. A grouped session
+    # (`new-session -t <session>`) shares the window list but keeps an independent
+    # active window and size per client. Without this, attaching a second client
+    # to the same session switches the active window for ALL clients — so every
+    # panel ends up mirroring the same window. Torn down when this socket closes.
+    view_session: Optional[str] = f"{session_name}__v{uuid.uuid4().hex[:8]}"
+    try:
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", view_session, "-t", session_name],
+            check=True,
+            env=pty_env,
+            timeout=5,
+        )
+        attach_target = f"{view_session}:{window_name}"
+    except (subprocess.SubprocessError, OSError) as e:
+        # Fall back to direct attach (the pre-existing shared-view behavior).
+        logger.warning("Grouped view session failed (%s); direct attach", e)
+        view_session = None
+        attach_target = f"{session_name}:{window_name}"
+
     proc = subprocess.Popen(
-        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
+        ["tmux", "-u", "attach-session", "-t", attach_target],
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
@@ -1004,6 +1516,18 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         except asyncio.TimeoutError:
             proc.kill()
             await asyncio.to_thread(proc.wait)
+        # Tear down this connection's grouped view session. Killing a grouped
+        # session does NOT affect the real session or its windows (the original
+        # session still owns them), so the agents keep running.
+        if view_session:
+            try:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", view_session],
+                    check=False,
+                    timeout=5,
+                )
+            except (subprocess.SubprocessError, OSError):
+                pass
 
 
 # ── Flow management endpoints ────────────────────────────────────────

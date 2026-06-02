@@ -46,6 +46,10 @@ dependencies = [
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
 
+# Taime first-party plugin: captures CAO events into the activity-graph DB.
+[project.entry-points."cao.plugins"]
+taime-activity = "cli_agent_orchestrator.plugins.cao_taime_activity:TaimeActivityPlugin"
+
 [project.urls]
 Homepage = "https://github.com/awslabs/cli-agent-orchestrator"
 Repository = "https://github.com/awslabs/cli-agent-orchestrator"

@@ -106,6 +106,33 @@ DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
 # =============================================================================
+# Taime Worktree Isolation (agent activity attribution)
+# =============================================================================
+# Root for Taime-managed per-agent git worktrees. Each isolated agent gets its
+# own worktree + branch off the project HEAD here, OUTSIDE the project tree so
+# the main checkout stays pristine and the watcher never sees nested checkouts.
+TAIME_WORKTREES_DIR = CAO_HOME_DIR / "taime-worktrees"
+
+# Gitignored heavy paths symlinked from the main checkout into a fresh worktree
+# so agents don't start with a broken build (no node_modules/.venv/etc).
+# Operators can override via CAO_WORKTREE_LINK_DIRS (comma-separated).
+# (Parsed inline rather than via _split_env_list, which is defined later below.)
+WORKTREE_LINK_DIRS = [
+    item.strip()
+    for item in os.environ.get("CAO_WORKTREE_LINK_DIRS", "").split(",")
+    if item.strip()
+] or [
+    "node_modules",
+    ".venv",
+    "venv",
+    "target",
+    "dist",
+    ".next",
+    ".turbo",
+    "vendor",
+]
+
+# =============================================================================
 # Server Configuration
 # =============================================================================
 # FastAPI server settings for the CAO API
