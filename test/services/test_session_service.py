@@ -35,6 +35,7 @@ class TestIsViewSession:
             "cao-foo__v1a2b3c4d-extra",  # suffix not anchored to end
             "cao-foo__v1a2b3c",  # only 7 hex chars
             "cao-foo__vXYZ12345",  # non-hex chars
+            "cao-foo__v1a2b3c4d\n",  # trailing newline (\\Z, not $, anchors the end)
         ],
     )
     def test_non_view_session_does_not_match(self, name):

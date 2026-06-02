@@ -43,6 +43,7 @@ from cli_agent_orchestrator.constants import (
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
+    SESSION_PREFIX,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
@@ -341,11 +342,17 @@ async def lifespan(app: FastAPI):
     # connections that crashed before their teardown ran. These grouped views
     # own no windows/agents, so killing them is always safe. Never let a stray
     # tmux error abort startup.
+    #
+    # list_sessions() returns EVERY tmux session on the server (no prefix
+    # filter), so require the CAO prefix too: real view sessions are always
+    # ``cao-…__v<hex>``, and this prevents killing an unrelated user tmux
+    # session that merely happens to end in ``__v`` + 8 hex.
     try:
         reaped = 0
         for session in tmux_client.list_sessions():
-            if is_view_session(session["id"]):
-                if tmux_client.kill_session(session["id"]):
+            sid = session["id"]
+            if sid.startswith(SESSION_PREFIX) and is_view_session(sid):
+                if tmux_client.kill_session(sid):
                     reaped += 1
         if reaped:
             logger.info("Reaped %d orphaned view session(s) at startup", reaped)
@@ -608,8 +615,6 @@ async def create_session(
             # would become 68 chars and fail downstream validation. Check
             # the *effective* prefixed value here so the rejection happens
             # at the boundary with a clear message.
-            from cli_agent_orchestrator.constants import SESSION_PREFIX
-
             effective = (
                 session_name
                 if session_name.startswith(SESSION_PREFIX)

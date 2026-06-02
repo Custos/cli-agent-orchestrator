@@ -32,8 +32,9 @@ SESSION_PREFIX = "cao-"
 # starts with the already-prefixed real name it would otherwise leak into
 # ``list_sessions()`` as a phantom row, so naming + detection live here, once.
 VIEW_SESSION_SUFFIX_HEX_LEN = 8
-# Anchored: ``__v`` + exactly N hex chars + end-of-string.
-VIEW_SESSION_PATTERN = re.compile(rf"__v[0-9a-f]{{{VIEW_SESSION_SUFFIX_HEX_LEN}}}$")
+# Anchored with ``\Z`` (true end-of-string — unlike ``$`` it does not also match
+# before a trailing newline): ``__v`` + exactly N hex chars + end-of-string.
+VIEW_SESSION_PATTERN = re.compile(rf"__v[0-9a-f]{{{VIEW_SESSION_SUFFIX_HEX_LEN}}}\Z")
 
 
 def make_view_session_name(session_name: str) -> str:
