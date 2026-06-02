@@ -10,7 +10,6 @@ import signal
 import struct
 import subprocess
 import termios
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, cast
@@ -37,6 +36,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     init_db,
 )
+from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
     CAO_HOME_DIR,
@@ -49,6 +49,8 @@ from cli_agent_orchestrator.constants import (
     TERMINAL_LOG_DIR,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
+    is_view_session,
+    make_view_session_name,
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -334,6 +336,21 @@ async def lifespan(app: FastAPI):
     inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
     inbox_observer.start()
     logger.info("Inbox watcher started (PollingObserver)")
+
+    # Reap orphaned per-connection view sessions left behind by terminal_ws
+    # connections that crashed before their teardown ran. These grouped views
+    # own no windows/agents, so killing them is always safe. Never let a stray
+    # tmux error abort startup.
+    try:
+        reaped = 0
+        for session in tmux_client.list_sessions():
+            if is_view_session(session["id"]):
+                if tmux_client.kill_session(session["id"]):
+                    reaped += 1
+        if reaped:
+            logger.info("Reaped %d orphaned view session(s) at startup", reaped)
+    except Exception:
+        logger.exception("Failed to reap orphaned view sessions at startup")
 
     yield
 
@@ -1395,7 +1412,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # active window and size per client. Without this, attaching a second client
     # to the same session switches the active window for ALL clients — so every
     # panel ends up mirroring the same window. Torn down when this socket closes.
-    view_session: Optional[str] = f"{session_name}__v{uuid.uuid4().hex[:8]}"
+    view_session: Optional[str] = make_view_session_name(session_name)
     try:
         subprocess.run(
             ["tmux", "new-session", "-d", "-s", view_session, "-t", session_name],

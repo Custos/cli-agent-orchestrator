@@ -5,11 +5,41 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.services.session_service import (
+    _is_view_session,
     create_session,
     delete_session,
     get_session,
     list_sessions,
 )
+
+
+class TestIsViewSession:
+    """Tests for per-connection view-session detection."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "cao-foo__v1a2b3c4d",
+            "cao-foo__v00000000",
+        ],
+    )
+    def test_view_session_matches(self, name):
+        """Names ending in __v + exactly 8 hex chars are view sessions."""
+        assert _is_view_session(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "cao-foo",  # real session, no view suffix
+            "cao-foo__version",  # not the __v<hex> shape
+            "cao-foo__v1a2b3c4d-extra",  # suffix not anchored to end
+            "cao-foo__v1a2b3c",  # only 7 hex chars
+            "cao-foo__vXYZ12345",  # non-hex chars
+        ],
+    )
+    def test_non_view_session_does_not_match(self, name):
+        """Real sessions and near-misses are NOT treated as view sessions."""
+        assert _is_view_session(name) is False
 
 
 class TestCreateSession:
@@ -58,6 +88,7 @@ class TestListSessions:
         mock_tmux.list_sessions.return_value = [
             {"id": "cao-session1", "name": "Session 1"},
             {"id": "cao-session2", "name": "Session 2"},
+            {"id": "cao-session1__v1a2b3c4d", "name": "View"},  # phantom view session
             {"id": "other-session", "name": "Other"},
         ]
 
@@ -65,6 +96,8 @@ class TestListSessions:
 
         assert len(result) == 2
         assert all(s["id"].startswith("cao-") for s in result)
+        # The per-connection view session must be filtered out.
+        assert not any(_is_view_session(s["id"]) for s in result)
 
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_list_sessions_empty(self, mock_tmux):
