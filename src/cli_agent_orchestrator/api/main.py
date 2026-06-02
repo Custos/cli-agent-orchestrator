@@ -10,6 +10,7 @@ import signal
 import struct
 import subprocess
 import termios
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, cast
@@ -1386,8 +1387,31 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # browser-side xterm.js renderer sees the escape sequences it expects.
     # Any explicit non-dumb TERM the operator set is preserved.
     pty_env = _build_pty_env()
+
+    # Each WebSocket gets its OWN tmux client view via a per-connection grouped
+    # session, so two panels showing different windows of the SAME session don't
+    # fight over the session's single "current window" pointer. A grouped session
+    # (`new-session -t <session>`) shares the window list but keeps an independent
+    # active window and size per client. Without this, attaching a second client
+    # to the same session switches the active window for ALL clients — so every
+    # panel ends up mirroring the same window. Torn down when this socket closes.
+    view_session: Optional[str] = f"{session_name}__v{uuid.uuid4().hex[:8]}"
+    try:
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", view_session, "-t", session_name],
+            check=True,
+            env=pty_env,
+            timeout=5,
+        )
+        attach_target = f"{view_session}:{window_name}"
+    except (subprocess.SubprocessError, OSError) as e:
+        # Fall back to direct attach (the pre-existing shared-view behavior).
+        logger.warning("Grouped view session failed (%s); direct attach", e)
+        view_session = None
+        attach_target = f"{session_name}:{window_name}"
+
     proc = subprocess.Popen(
-        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
+        ["tmux", "-u", "attach-session", "-t", attach_target],
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
@@ -1492,6 +1516,18 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         except asyncio.TimeoutError:
             proc.kill()
             await asyncio.to_thread(proc.wait)
+        # Tear down this connection's grouped view session. Killing a grouped
+        # session does NOT affect the real session or its windows (the original
+        # session still owns them), so the agents keep running.
+        if view_session:
+            try:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", view_session],
+                    check=False,
+                    timeout=5,
+                )
+            except (subprocess.SubprocessError, OSError):
+                pass
 
 
 # ── Flow management endpoints ────────────────────────────────────────
